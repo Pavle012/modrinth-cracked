@@ -190,8 +190,15 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      # Upstream pins its toolchain in rust-toolchain.toml, so cargo inside src/
+      # uses that version, not the one installed above. Targets must be added
+      # from inside src/ for the universal macOS build.
+      - name: Add macOS targets to the pinned toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: src
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
