@@ -1,0 +1,639 @@
+From f068e0490bf6bd2c65229ab86facf02dd447b0dd Mon Sep 17 00:00:00 2001
+From: Pavle012 <pavle@example.invalid>
+Date: Fri, 20 Nov 2026 20:23:15 +0000
+Subject: [PATCH] Add offline accounts
+
+Adds username-only offline accounts alongside Microsoft accounts.
+Offline accounts are stored in minecraft_users with a marker in
+refresh_token (no DB migration), skip token refresh and Mojang profile
+lookups, use the vanilla OfflinePlayer UUID, launch with user_type
+legacy, and skip the Mojang session join.
+---
+ .../minecraft-accounts/accounts-card.vue      | 108 ++++++++++++-
+ apps/app-frontend/src/helpers/auth.js         |  10 ++
+ apps/app/build.rs                             |   1 +
+ apps/app/src/api/auth.rs                      |   7 +
+ packages/app-lib/src/api/instance/run.rs      |   3 +-
+ packages/app-lib/src/api/minecraft_auth.rs    |  12 ++
+ packages/app-lib/src/api/minecraft_skins.rs   |   3 +
+ packages/app-lib/src/launcher/args.rs         |  10 +-
+ packages/app-lib/src/state/minecraft_auth.rs  |  62 +++++++-
+ packages/app-lib/src/util/mod.rs              |   1 +
+ packages/app-lib/src/util/offline_account.rs  | 150 ++++++++++++++++++
+ 11 files changed, 362 insertions(+), 5 deletions(-)
+ create mode 100644 packages/app-lib/src/util/offline_account.rs
+
+diff --git a/apps/app-frontend/src/features/minecraft-accounts/accounts-card.vue b/apps/app-frontend/src/features/minecraft-accounts/accounts-card.vue
+index 651b377..22ed29a 100644
+--- a/apps/app-frontend/src/features/minecraft-accounts/accounts-card.vue
++++ b/apps/app-frontend/src/features/minecraft-accounts/accounts-card.vue
+@@ -9,6 +9,10 @@
+ 			<SpinnerIcon v-else class="animate-spin" />
+ 			{{ formatMessage(messages.signInToMinecraft) }}
+ 		</Button>
++		<Button :disabled="loginDisabled" @click="openOfflineModal()">
++			<UserIcon />
++			{{ formatMessage(messages.addOfflineAccount) }}
++		</Button>
+ 	</div>
+ 	<Accordion
+ 		v-else
+@@ -57,6 +61,12 @@
+ 						>
+ 							{{ account.profile.name }}
+ 						</p>
++						<span
++							v-if="account.offline"
++							class="shrink-0 rounded-full bg-surface-5 px-2 py-0.5 text-xs text-secondary"
++						>
++							{{ formatMessage(messages.offlineBadge) }}
++						</span>
+ 					</button>
+ 					<IconButton
+ 						v-tooltip="formatMessage(messages.removeAccount)"
+@@ -80,9 +90,52 @@
+ 					<PlusIcon />
+ 					{{ formatMessage(messages.addAccount) }}
+ 				</Button>
++				<Button
++					class="w-full !bg-button-bg !text-primary ![box-shadow:var(--shadow-button)]"
++					:disabled="loginDisabled"
++					@click="openOfflineModal()"
++				>
++					<UserIcon />
++					{{ formatMessage(messages.addOfflineAccount) }}
++				</Button>
+ 			</div>
+ 		</div>
+ 	</Accordion>
++
++	<NewModal ref="offlineModal" :header="formatMessage(messages.addOfflineAccount)" max-width="460px">
++		<div class="flex flex-col gap-3">
++			<p class="m-0 text-primary">{{ formatMessage(messages.offlineDescription) }}</p>
++			<Input
++				v-model="offlineUsername"
++				autocomplete="off"
++				:maxlength="16"
++				:placeholder="formatMessage(messages.offlineUsernamePlaceholder)"
++				:aria-label="formatMessage(messages.offlineUsernamePlaceholder)"
++				@keydown.enter="offlineUsernameValid && addOffline()"
++			/>
++			<p v-if="offlineUsername.length > 0 && !offlineUsernameValid" class="m-0 text-sm text-red">
++				{{ formatMessage(messages.offlineUsernameInvalid) }}
++			</p>
++		</div>
++		<template #actions>
++			<div class="flex justify-end gap-2">
++				<Button type="outlined" :disabled="offlinePending" @click="offlineModal?.hide()">
++					<XIcon aria-hidden="true" />
++					{{ formatMessage(commonMessages.cancelButton) }}
++				</Button>
++				<Button
++					type="colored"
++					color="brand"
++					:disabled="!offlineUsernameValid"
++					:loading="offlinePending"
++					@click="addOffline()"
++				>
++					<PlusIcon aria-hidden="true" />
++					{{ formatMessage(messages.addOfflineAccount) }}
++				</Button>
++			</div>
++		</template>
++	</NewModal>
+ </template>
+ 
+ <script setup lang="ts">
+@@ -93,23 +146,29 @@ import {
+ 	RadioButtonIcon,
+ 	SpinnerIcon,
+ 	TrashIcon,
++	UserIcon,
++	XIcon,
+ } from '@modrinth/assets'
+ import {
+ 	Accordion,
+ 	Avatar,
+ 	Button,
++	commonMessages,
+ 	defineMessages,
+ 	IconButton,
++	Input,
+ 	injectNotificationManager,
++	NewModal,
+ 	useVIntl,
+ } from '@modrinth/ui'
+ import type { Ref } from 'vue'
+-import { computed, onUnmounted, ref } from 'vue'
++import { computed, onUnmounted, ref, useTemplateRef } from 'vue'
+ 
+ import { useAppEvent } from '@/composables/use-app-event'
+ import { handleSevereError } from '@/composables/use-error.js'
+ import { trackEvent } from '@/helpers/analytics'
+ import {
++	add_offline_user,
+ 	get_default_user,
+ 	login as login_flow,
+ 	remove_user,
+@@ -132,6 +191,7 @@ type MinecraftCredential = {
+ 		id: string
+ 		name: string
+ 	}
++	offline?: boolean
+ }
+ 
+ const accounts: Ref<MinecraftCredential[]> = ref([])
+@@ -189,6 +249,7 @@ defineExpose({
+ 	setEquippedSkin,
+ 	setLoginDisabled,
+ 	login,
++	openOfflineModal,
+ 	loginDisabled,
+ })
+ 
+@@ -244,6 +305,30 @@ async function login() {
+ 	loginDisabled.value = false
+ }
+ 
++const offlineModal = useTemplateRef<InstanceType<typeof NewModal>>('offlineModal')
++const offlineUsername = ref('')
++const offlinePending = ref(false)
++const offlineUsernameValid = computed(() => /^[A-Za-z0-9_]{3,16}$/.test(offlineUsername.value.trim()))
++
++function openOfflineModal() {
++	offlineUsername.value = ''
++	offlineModal.value?.show()
++}
++
++async function addOffline() {
++	if (!offlineUsernameValid.value || offlinePending.value) return
++	offlinePending.value = true
++	try {
++		const added = await add_offline_user(offlineUsername.value.trim())
++		offlineModal.value?.hide()
++		await setAccount(added)
++	} catch (error) {
++		handleError(error)
++	} finally {
++		offlinePending.value = false
++	}
++}
++
+ async function logout(id: string) {
+ 	await remove_user(id).catch(handleError)
+ 	await refreshValues()
+@@ -286,5 +371,26 @@ const messages = defineMessages({
+ 		id: 'minecraft-account.sign-in',
+ 		defaultMessage: 'Sign in to Minecraft',
+ 	},
++	addOfflineAccount: {
++		id: 'minecraft-account.add-offline-account',
++		defaultMessage: 'Add offline account',
++	},
++	offlineBadge: {
++		id: 'minecraft-account.offline-badge',
++		defaultMessage: 'Offline',
++	},
++	offlineDescription: {
++		id: 'minecraft-account.offline-description',
++		defaultMessage:
++			'Offline accounts only work on offline-mode servers, LAN and singleplayer. Online-mode servers will reject them, and skins are not available.',
++	},
++	offlineUsernamePlaceholder: {
++		id: 'minecraft-account.offline-username-placeholder',
++		defaultMessage: 'Username',
++	},
++	offlineUsernameInvalid: {
++		id: 'minecraft-account.offline-username-invalid',
++		defaultMessage: 'Use 3-16 characters: letters, numbers and underscores.',
++	},
+ })
+ </script>
+diff --git a/apps/app-frontend/src/helpers/auth.js b/apps/app-frontend/src/helpers/auth.js
+index 94bd13e..bf702cd 100644
+--- a/apps/app-frontend/src/helpers/auth.js
++++ b/apps/app-frontend/src/helpers/auth.js
+@@ -57,6 +57,16 @@ export async function remove_user(user) {
+ 	return await invoke('plugin:auth|remove_user', { user })
+ }
+ 
++/**
++ * Adds an offline account (no Microsoft login) and makes it the active one.
++ * Offline accounts only work on offline-mode servers, LAN and singleplayer.
++ * @param {string} username 3-16 characters: letters, numbers and underscores
++ * @returns {Promise<Credential>}
++ */
++export async function add_offline_user(username) {
++	return await invoke('plugin:auth|add_offline_user', { username })
++}
++
+ /**
+  * Returns a list of users
+  * @returns {Promise<Credential[]>}
+diff --git a/apps/app/build.rs b/apps/app/build.rs
+index f53ffdf..24028c5 100644
+--- a/apps/app/build.rs
++++ b/apps/app/build.rs
+@@ -14,6 +14,7 @@ fn main() {
+                     .commands(&[
+                         "check_reachable",
+                         "login",
++                        "add_offline_user",
+                         "remove_user",
+                         "get_default_user",
+                         "set_default_user",
+diff --git a/apps/app/src/api/auth.rs b/apps/app/src/api/auth.rs
+index 1a59db1..c0de9a1 100644
+--- a/apps/app/src/api/auth.rs
++++ b/apps/app/src/api/auth.rs
+@@ -10,6 +10,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
+         .invoke_handler(tauri::generate_handler![
+             check_reachable,
+             login,
++            add_offline_user,
+             remove_user,
+             get_default_user,
+             set_default_user,
+@@ -84,6 +85,12 @@ pub async fn login<R: Runtime>(
+     Ok(None)
+ }
+ 
++/// Adds an offline account (no Microsoft login) and makes it the active one.
++#[tauri::command]
++pub async fn add_offline_user(username: String) -> Result<Credentials> {
++    Ok(minecraft_auth::add_offline_user(&username).await?)
++}
++
+ #[tauri::command]
+ pub async fn remove_user(user: uuid::Uuid) -> Result<()> {
+     Ok(minecraft_auth::remove_user(user).await?)
+diff --git a/packages/app-lib/src/api/instance/run.rs b/packages/app-lib/src/api/instance/run.rs
+index d5c3f30..2290da3 100644
+--- a/packages/app-lib/src/api/instance/run.rs
++++ b/packages/app-lib/src/api/instance/run.rs
+@@ -225,7 +225,8 @@ async fn run_credentials(
+         mc_set_options.push(("fullscreen".to_string(), "true".to_string()));
+     }
+ 
+-    if let Some(project_id) = server_play_project_id(&context.link)
++    if !credentials.is_offline_account()
++        && let Some(project_id) = server_play_project_id(&context.link)
+         && !project_id.trim().is_empty()
+     {
+         let server_id = uuid::Uuid::new_v4().to_string();
+diff --git a/packages/app-lib/src/api/minecraft_auth.rs b/packages/app-lib/src/api/minecraft_auth.rs
+index d3a07f1..922c2ce 100644
+--- a/packages/app-lib/src/api/minecraft_auth.rs
++++ b/packages/app-lib/src/api/minecraft_auth.rs
+@@ -48,6 +48,18 @@ pub async fn finish_login(
+     Ok(credentials)
+ }
+ 
++/// Adds an offline account (no Microsoft login) and makes it the active one.
++/// Offline accounts only work on offline-mode servers, LAN and singleplayer.
++#[tracing::instrument]
++pub async fn add_offline_user(username: &str) -> crate::Result<Credentials> {
++    let state = State::get().await?;
++
++    let credentials = Credentials::new_offline(username)?;
++    credentials.upsert(&state.pool).await?;
++
++    Ok(credentials)
++}
++
+ #[tracing::instrument]
+ pub async fn get_default_user() -> crate::Result<Option<uuid::Uuid>> {
+     let state = State::get().await?;
+diff --git a/packages/app-lib/src/api/minecraft_skins.rs b/packages/app-lib/src/api/minecraft_skins.rs
+index 822bf33..6f1cd0a 100644
+--- a/packages/app-lib/src/api/minecraft_skins.rs
++++ b/packages/app-lib/src/api/minecraft_skins.rs
+@@ -547,6 +547,7 @@ pub async fn add_and_equip_custom_skin(
+     let selected_credentials = Credentials::get_default_credential(&state.pool)
+         .await?
+         .ok_or(ErrorKind::NotLoggedIn)?;
++    selected_credentials.ensure_online_account()?;
+     let cape_id = cape.map(|cape| cape.id);
+     let local_texture_key = local_skin_texture_key(&texture_blob);
+ 
+@@ -703,6 +704,7 @@ pub async fn equip_skin(skin: Skin) -> crate::Result<()> {
+     let selected_credentials = Credentials::get_default_credential(&state.pool)
+         .await?
+         .ok_or(ErrorKind::NotLoggedIn)?;
++    selected_credentials.ensure_online_account()?;
+ 
+     set_pending_skin_change(PendingSkinChange::Equip {
+         selected_credentials,
+@@ -985,6 +987,7 @@ pub async fn unequip_skin() -> crate::Result<()> {
+     let selected_credentials = Credentials::get_default_credential(&state.pool)
+         .await?
+         .ok_or(ErrorKind::NotLoggedIn)?;
++    selected_credentials.ensure_online_account()?;
+ 
+     set_pending_skin_change(PendingSkinChange::Unequip {
+         selected_credentials,
+diff --git a/packages/app-lib/src/launcher/args.rs b/packages/app-lib/src/launcher/args.rs
+index a59dcc7..3fd7819 100644
+--- a/packages/app-lib/src/launcher/args.rs
++++ b/packages/app-lib/src/launcher/args.rs
+@@ -265,6 +265,11 @@ pub async fn get_minecraft_arguments(
+     quick_play_version: QuickPlayVersion,
+ ) -> crate::Result<Vec<String>> {
+     let access_token = credentials.access_token.clone();
++    let user_type = if credentials.is_offline_account() {
++        "legacy"
++    } else {
++        "msa"
++    };
+     let profile = credentials.maybe_online_profile().await;
+     let mut parsed_arguments = Vec::new();
+ 
+@@ -274,7 +279,7 @@ pub async fn get_minecraft_arguments(
+             &mut parsed_arguments,
+             |arg| {
+                 parse_minecraft_argument(
+-                    arg,
++                    &arg.replace("${user_type}", user_type),
+                     &access_token,
+                     &profile.name,
+                     profile.id,
+@@ -293,7 +298,8 @@ pub async fn get_minecraft_arguments(
+     } else if let Some(legacy_arguments) = legacy_arguments {
+         for x in legacy_arguments.split(' ') {
+             parsed_arguments.push(parse_minecraft_argument(
+-                &x.replace(' ', TEMPORARY_REPLACE_CHAR),
++                &x.replace(' ', TEMPORARY_REPLACE_CHAR)
++                    .replace("${user_type}", user_type),
+                 &access_token,
+                 &profile.name,
+                 profile.id,
+diff --git a/packages/app-lib/src/state/minecraft_auth.rs b/packages/app-lib/src/state/minecraft_auth.rs
+index 4e1a89a..db9bcab 100644
+--- a/packages/app-lib/src/state/minecraft_auth.rs
++++ b/packages/app-lib/src/state/minecraft_auth.rs
+@@ -342,6 +342,11 @@ impl Credentials {
+         &mut self,
+         exec: impl sqlx::Executor<'_, Database = sqlx::Sqlite> + Copy,
+     ) -> crate::Result<()> {
++        // Offline accounts have nothing to refresh
++        if self.is_offline_account() {
++            return Ok(());
++        }
++
+         // Use a margin of 5 minutes to give e.g. Minecraft and potentially
+         // other operations that depend on a fresh token 5 minutes to complete
+         // from now, and deal with some classes of clock skew
+@@ -422,6 +427,12 @@ impl Credentials {
+         &self,
+         cache_intent: OnlineProfileCacheIntent,
+     ) -> Option<Arc<MinecraftProfile>> {
++        // Offline accounts have no Mojang profile; skip the request entirely
++        // (a fake token would only trigger 401s and the auth error backoff)
++        if self.is_offline_account() {
++            return None;
++        }
++
+         let max_age = cache_intent.max_age();
+         let stale_profile = {
+             let mut profile_cache = PROFILE_CACHE.lock().await;
+@@ -721,6 +732,54 @@ impl Credentials {
+     }
+ }
+ 
++impl Credentials {
++    /// Whether this is an offline account (no Microsoft login behind it).
++    pub fn is_offline_account(&self) -> bool {
++        self.refresh_token
++            == crate::util::offline_account::OFFLINE_REFRESH_TOKEN
++    }
++
++    /// Creates an active offline account for `username`, using the same UUID
++    /// vanilla offline-mode servers derive from the name.
++    pub fn new_offline(username: &str) -> crate::Result<Self> {
++        use crate::util::offline_account::{
++            OFFLINE_ACCESS_TOKEN, OFFLINE_REFRESH_TOKEN, is_valid_username,
++            offline_uuid,
++        };
++
++        let username = username.trim();
++        if !is_valid_username(username) {
++            anyhow::bail!(ErrorKind::InputError(
++                "Offline usernames must be 3-16 characters long and only contain letters, numbers and underscores"
++                    .to_string()
++            ));
++        }
++
++        Ok(Self {
++            offline_profile: MinecraftProfile {
++                id: offline_uuid(username),
++                name: username.to_string(),
++                ..MinecraftProfile::default()
++            },
++            access_token: OFFLINE_ACCESS_TOKEN.to_string(),
++            refresh_token: OFFLINE_REFRESH_TOKEN.to_string(),
++            // Never expires; far enough in the future to fit the DB timestamp
++            expires: Utc::now() + Duration::days(365 * 100),
++            active: true,
++        })
++    }
++
++    /// Fails for offline accounts; used by features that need Mojang's APIs.
++    pub fn ensure_online_account(&self) -> crate::Result<()> {
++        if self.is_offline_account() {
++            anyhow::bail!(ErrorKind::InputError(
++                "This is not available for offline accounts".to_string()
++            ));
++        }
++        Ok(())
++    }
++}
++
+ impl Serialize for Credentials {
+     fn serialize<S: Serializer>(
+         &self,
+@@ -751,12 +810,13 @@ impl Serialize for Credentials {
+                 ),
+         };
+ 
+-        let mut ser = serializer.serialize_struct("Credentials", 5)?;
++        let mut ser = serializer.serialize_struct("Credentials", 6)?;
+         ser.serialize_field("profile", &*profile)?;
+         ser.serialize_field("access_token", &self.access_token)?;
+         ser.serialize_field("refresh_token", &self.refresh_token)?;
+         ser.serialize_field("expires", &self.expires)?;
+         ser.serialize_field("active", &self.active)?;
++        ser.serialize_field("offline", &self.is_offline_account())?;
+         ser.end()
+     }
+ }
+diff --git a/packages/app-lib/src/util/mod.rs b/packages/app-lib/src/util/mod.rs
+index 3fa7b83..113e591 100644
+--- a/packages/app-lib/src/util/mod.rs
++++ b/packages/app-lib/src/util/mod.rs
+@@ -4,6 +4,7 @@ pub mod fetch;
+ pub mod io;
+ pub mod jre;
+ pub mod network;
++pub mod offline_account;
+ pub mod platform;
+ pub mod protocol_version;
+ pub mod redactions;
+diff --git a/packages/app-lib/src/util/offline_account.rs b/packages/app-lib/src/util/offline_account.rs
+new file mode 100644
+index 0000000..7e7c721
+--- /dev/null
++++ b/packages/app-lib/src/util/offline_account.rs
+@@ -0,0 +1,150 @@
++//! Helpers for offline accounts: accounts that are not backed by a Microsoft
++//! login and can only be used on offline-mode servers, LAN and singleplayer.
++//!
++//! Self-contained on purpose (no extra dependencies) so the patch that adds
++//! offline accounts stays small and easy to carry across upstream releases.
++
++use uuid::Uuid;
++
++/// Marker stored in the `refresh_token` column for offline accounts. Real
++/// Microsoft refresh tokens never look like this, and storing the marker in an
++/// existing column means no database migration is needed (so the database
++/// stays compatible with the official app).
++pub const OFFLINE_REFRESH_TOKEN: &str = "offline-account";
++
++/// Dummy access token handed to the game for offline accounts.
++pub const OFFLINE_ACCESS_TOKEN: &str = "0";
++
++pub const MIN_USERNAME_LEN: usize = 3;
++pub const MAX_USERNAME_LEN: usize = 16;
++
++/// Whether `username` is acceptable as an offline player name
++/// (3-16 characters, ASCII letters, digits and underscores).
++pub fn is_valid_username(username: &str) -> bool {
++    (MIN_USERNAME_LEN..=MAX_USERNAME_LEN).contains(&username.len())
++        && username
++            .bytes()
++            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
++}
++
++/// The UUID vanilla offline-mode servers assign to `username`, i.e. Java's
++/// `UUID.nameUUIDFromBytes("OfflinePlayer:<name>".getBytes(UTF_8))`.
++pub fn offline_uuid(username: &str) -> Uuid {
++    let mut hash = md5(format!("OfflinePlayer:{username}").as_bytes());
++    hash[6] = (hash[6] & 0x0f) | 0x30; // version 3
++    hash[8] = (hash[8] & 0x3f) | 0x80; // IETF variant
++    Uuid::from_bytes(hash)
++}
++
++#[rustfmt::skip]
++const MD5_K: [u32; 64] = [
++    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
++    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
++    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
++    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
++    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
++    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
++    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
++    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
++];
++
++#[rustfmt::skip]
++const MD5_S: [u32; 64] = [
++    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
++    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
++    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
++    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
++];
++
++/// Plain MD5 (RFC 1321). Only used to derive offline UUIDs, never for security.
++fn md5(input: &[u8]) -> [u8; 16] {
++    let mut a0: u32 = 0x6745_2301;
++    let mut b0: u32 = 0xefcd_ab89;
++    let mut c0: u32 = 0x98ba_dcfe;
++    let mut d0: u32 = 0x1032_5476;
++
++    let mut message = input.to_vec();
++    message.push(0x80);
++    while message.len() % 64 != 56 {
++        message.push(0);
++    }
++    message
++        .extend_from_slice(&(input.len() as u64).wrapping_mul(8).to_le_bytes());
++
++    for chunk in message.chunks_exact(64) {
++        let mut m = [0u32; 16];
++        for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {
++            *word =
++                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
++        }
++
++        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
++        for i in 0..64 {
++            let (f, g) = match i / 16 {
++                0 => ((b & c) | (!b & d), i),
++                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
++                2 => (b ^ c ^ d, (3 * i + 5) % 16),
++                _ => (c ^ (b | !d), (7 * i) % 16),
++            };
++            let f = f.wrapping_add(a).wrapping_add(MD5_K[i]).wrapping_add(m[g]);
++            a = d;
++            d = c;
++            c = b;
++            b = b.wrapping_add(f.rotate_left(MD5_S[i]));
++        }
++
++        a0 = a0.wrapping_add(a);
++        b0 = b0.wrapping_add(b);
++        c0 = c0.wrapping_add(c);
++        d0 = d0.wrapping_add(d);
++    }
++
++    let mut out = [0u8; 16];
++    out[0..4].copy_from_slice(&a0.to_le_bytes());
++    out[4..8].copy_from_slice(&b0.to_le_bytes());
++    out[8..12].copy_from_slice(&c0.to_le_bytes());
++    out[12..16].copy_from_slice(&d0.to_le_bytes());
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn hex(bytes: &[u8]) -> String {
++        bytes.iter().map(|b| format!("{b:02x}")).collect()
++    }
++
++    #[test]
++    fn md5_matches_rfc_1321_vectors() {
++        assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
++        assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
++        assert_eq!(
++            hex(&md5(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890")),
++            "57edf4a22be3c955ac49da2e2107b67a"
++        );
++    }
++
++    #[test]
++    fn offline_uuid_matches_vanilla() {
++        // Values from Java's UUID.nameUUIDFromBytes("OfflinePlayer:<name>").
++        assert_eq!(
++            offline_uuid("Notch").to_string(),
++            "b50ad385-829d-3141-a216-7e7d7539ba7f"
++        );
++        assert_eq!(
++            offline_uuid("Steve_01").to_string(),
++            "e4270dab-5764-390b-8cc6-0cf94d9aeee9"
++        );
++    }
++
++    #[test]
++    fn username_validation() {
++        assert!(is_valid_username("Pavle012"));
++        assert!(is_valid_username("a_b"));
++        assert!(!is_valid_username("ab"));
++        assert!(!is_valid_username("this_name_is_way_too_long"));
++        assert!(!is_valid_username("bad name"));
++        assert!(!is_valid_username("čšž_test"));
++    }
++}
+-- 
+2.43.0
+

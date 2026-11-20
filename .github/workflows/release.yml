@@ -1,0 +1,284 @@
+name: Release patched Modrinth App
+
+# Builds upstream's release tag + the patches in ./patches, but only when
+# upstream (modrinth/code) publishes a new app release. Nothing is built from
+# upstream's main branch, so you only ever ship what upstream already released.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Build this upstream tag instead of the latest release (e.g. v0.23.5)"
+        required: false
+        type: string
+      revision:
+        description: "Patch revision, to republish the same upstream version (e.g. 2 -> v0.23.5-offline.2)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: modrinth/code
+  SUFFIX: offline
+
+jobs:
+  check:
+    name: Find new upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      upstream_tag: ${{ steps.decide.outputs.upstream_tag }}
+      fork_tag: ${{ steps.decide.outputs.fork_tag }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          INPUT_REV: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_TAG" ]; then
+            up="$INPUT_TAG"
+          else
+            # Latest published (non-draft, non-prerelease) app release: tags look like v1.2.3
+            up=$(gh api "repos/$UPSTREAM/releases?per_page=30" --jq \
+              '[.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))][0].tag_name')
+          fi
+          if [ -z "$up" ] || [ "$up" = "null" ]; then
+            echo "::error::Could not determine the latest upstream release"; exit 1
+          fi
+
+          if [ -n "$INPUT_REV" ]; then
+            fork_tag="${up}-${SUFFIX}.${INPUT_REV}"
+          else
+            fork_tag="${up}-${SUFFIX}"
+          fi
+
+          echo "upstream_tag=$up" >> "$GITHUB_OUTPUT"
+          echo "fork_tag=$fork_tag" >> "$GITHUB_OUTPUT"
+          echo "version=${fork_tag#v}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$fork_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$fork_tag already released, nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Will build $fork_tag from upstream $up"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail fast (seconds, not after a 30 minute build) if the patch no longer applies
+      - name: Verify patches apply to the upstream tag
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "${{ steps.decide.outputs.upstream_tag }}" \
+            "https://github.com/${UPSTREAM}.git" /tmp/upstream
+          cd /tmp/upstream
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            echo "Checking $p"
+            git apply --check --3way "$p"
+            git apply --index --3way "$p"
+          done
+
+      - name: Open an issue if the patches no longer apply
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Patches no longer apply to upstream ${{ steps.decide.outputs.upstream_tag }}"
+          if [ -z "$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')" ]; then
+            gh issue create --title "$title" \
+              --body "The patch check failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-22.04
+            tauri_args: "--bundles deb,appimage"
+            bundle_dir: target/release-with-thin-lto/bundle
+          - name: windows-x64
+            os: windows-latest
+            tauri_args: "--bundles nsis"
+            bundle_dir: target/release-with-thin-lto/bundle
+          - name: macos-universal
+            os: macos-latest
+            tauri_args: "--target universal-apple-darwin --bundles dmg"
+            bundle_dir: target/universal-apple-darwin/release-with-thin-lto/bundle
+    runs-on: ${{ matrix.os }}
+    env:
+      UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+      TURBO_TELEMETRY_DISABLED: 1
+      APPIMAGE_EXTRACT_AND_RUN: 1
+      NO_STRIP: true
+      TAURI_BUNDLER_DMG_IGNORE_CI: true
+    steps:
+      - name: Checkout fork (patches)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Checkout upstream at release tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.upstream_tag }}
+          path: src
+
+      - name: Apply patches
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          for p in "$GITHUB_WORKSPACE"/fork/patches/*.patch; do
+            echo "Applying $p"
+            git apply --index --3way "$p"
+          done
+
+      - name: Set version and environment
+        shell: bash
+        working-directory: src
+        run: |
+          python3 - <<'EOF'
+          import json, os, re
+          v = os.environ["VERSION"]
+          for path in ("apps/app/Cargo.toml", "packages/app-lib/Cargo.toml"):
+              s = open(path).read()
+              s = re.sub(r'(?m)^version = ".*"$', f'version = "{v}"', s, count=1)
+              open(path, "w").write(s)
+          path = "apps/app-frontend/package.json"
+          d = json.load(open(path))
+          d["version"] = v
+          open(path, "w").write(json.dumps(d, indent="\t") + "\n")
+          EOF
+          cp packages/app-lib/.env.prod packages/app-lib/.env
+
+          # Release build config WITHOUT upstream's updater (it would replace
+          # this build with the official one) and without upstream's signing.
+          cat > apps/app/tauri-offline.conf.json <<'EOF'
+          {
+            "bundle": {
+              "createUpdaterArtifacts": false,
+              "macOS": { "signingIdentity": "-" }
+            }
+          }
+          EOF
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src -> target
+          key: ${{ matrix.name }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: src/.nvmrc
+
+      - name: Setup Java (needed by app-lib build)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf
+
+      - name: Install JS dependencies
+        shell: bash
+        working-directory: src
+        run: |
+          corepack enable
+          pnpm install
+
+      - name: Build app
+        shell: bash
+        working-directory: src
+        run: >
+          pnpm --filter=@modrinth/app run tauri build
+          ${{ matrix.tauri_args }}
+          --config tauri-offline.conf.json
+          -- --profile release-with-thin-lto
+
+      - name: Collect bundles
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          find "${{ matrix.bundle_dir }}" -type f \
+            \( -name '*.deb' -o -name '*.AppImage' -o -name '*-setup.exe' -o -name '*.dmg' \) \
+            -print0 | while IFS= read -r -d '' f; do
+              base=$(basename "$f")
+              clean=$(echo "$base" | tr ' ' '-')
+              cp "$f" "$GITHUB_WORKSPACE/dist/$clean"
+            done
+          ls -la "$GITHUB_WORKSPACE/dist"
+          test -n "$(ls -A "$GITHUB_WORKSPACE/dist")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bundle-*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.fork_tag }}
+          UP: ${{ needs.check.outputs.upstream_tag }}
+        run: |
+          ls -la dist
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Modrinth App ${TAG#v} (offline accounts)" \
+            --notes "Upstream [$UP](https://github.com/${{ env.UPSTREAM }}/releases/tag/$UP) plus the offline accounts patch. Unsigned builds; this build does not auto-update."
+
+  notify-failure:
+    name: Report failed build
+    needs: [check, build, release]
+    if: ${{ always() && (needs.build.result == 'failure' || needs.release.result == 'failure') }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Build failed for ${{ needs.check.outputs.upstream_tag }}" \
+            --body "See the failed run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
