@@ -1,4 +1,4 @@
-From f068e0490bf6bd2c65229ab86facf02dd447b0dd Mon Sep 17 00:00:00 2001
+From d56f3752c1e9b60f8979156d1bfc300e20cc23dd Mon Sep 17 00:00:00 2001
 From: Pavle012 <pavle@example.invalid>
 Date: Fri, 20 Nov 2026 20:23:15 +0000
 Subject: [PATCH] Add offline accounts
@@ -9,20 +9,46 @@ refresh_token (no DB migration), skip token refresh and Mojang profile
 lookups, use the vanilla OfflinePlayer UUID, launch with user_type
 legacy, and skip the Mojang session join.
 ---
+ .../src/app/shell/sidebar/index.vue           |   7 +-
  .../minecraft-accounts/accounts-card.vue      | 108 ++++++++++++-
  apps/app-frontend/src/helpers/auth.js         |  10 ++
  apps/app/build.rs                             |   1 +
  apps/app/src/api/auth.rs                      |   7 +
  packages/app-lib/src/api/instance/run.rs      |   3 +-
- packages/app-lib/src/api/minecraft_auth.rs    |  12 ++
+ packages/app-lib/src/api/minecraft_auth.rs    |  20 +++
  packages/app-lib/src/api/minecraft_skins.rs   |   3 +
  packages/app-lib/src/launcher/args.rs         |  10 +-
  packages/app-lib/src/state/minecraft_auth.rs  |  62 +++++++-
  packages/app-lib/src/util/mod.rs              |   1 +
  packages/app-lib/src/util/offline_account.rs  | 150 ++++++++++++++++++
- 11 files changed, 362 insertions(+), 5 deletions(-)
+ 12 files changed, 372 insertions(+), 10 deletions(-)
  create mode 100644 packages/app-lib/src/util/offline_account.rs
 
+diff --git a/apps/app-frontend/src/app/shell/sidebar/index.vue b/apps/app-frontend/src/app/shell/sidebar/index.vue
+index a431fa5..aaf5327 100644
+--- a/apps/app-frontend/src/app/shell/sidebar/index.vue
++++ b/apps/app-frontend/src/app/shell/sidebar/index.vue
+@@ -30,7 +30,7 @@ const emit = defineEmits<{
+ 
+ const { formatMessage } = useVIntl()
+ const appTheme = useTheme()
+-const { hasLoggedIntoMinecraft, hasLoggedIntoModrinth, showChecklist } = injectOnboardingChecklist()
++const { hasLoggedIntoModrinth, showChecklist } = injectOnboardingChecklist()
+ const showFriendsList = computed(() => !showChecklist.value || hasLoggedIntoModrinth.value)
+ const accounts = ref<InstanceType<typeof AccountsCard> | null>(null)
+ const friends = ref<InstanceType<typeof FriendsList> | null>(null)
+@@ -112,10 +112,7 @@ const messages = defineMessages({
+ 					:style="promotionPaddingStyle"
+ 				></div>
+ 				<div class="sidebar-default-content hidden" :class="{ 'sidebar-enabled': visible }">
+-					<div
+-						v-show="hasLoggedIntoMinecraft"
+-						class="p-4 border-0 border-b-[1px] border-[--brand-gradient-border] border-solid"
+-					>
++					<div class="p-4 border-0 border-b-[1px] border-[--brand-gradient-border] border-solid">
+ 						<h3 class="text-base text-primary font-medium m-0">
+ 							{{ formatMessage(messages.playingAs) }}
+ 						</h3>
 diff --git a/apps/app-frontend/src/features/minecraft-accounts/accounts-card.vue b/apps/app-frontend/src/features/minecraft-accounts/accounts-card.vue
 index 651b377..22ed29a 100644
 --- a/apps/app-frontend/src/features/minecraft-accounts/accounts-card.vue
@@ -282,10 +308,10 @@ index d5c3f30..2290da3 100644
      {
          let server_id = uuid::Uuid::new_v4().to_string();
 diff --git a/packages/app-lib/src/api/minecraft_auth.rs b/packages/app-lib/src/api/minecraft_auth.rs
-index d3a07f1..922c2ce 100644
+index d3a07f1..ab44793 100644
 --- a/packages/app-lib/src/api/minecraft_auth.rs
 +++ b/packages/app-lib/src/api/minecraft_auth.rs
-@@ -48,6 +48,18 @@ pub async fn finish_login(
+@@ -48,6 +48,26 @@ pub async fn finish_login(
      Ok(credentials)
  }
  
@@ -297,6 +323,14 @@ index d3a07f1..922c2ce 100644
 +
 +    let credentials = Credentials::new_offline(username)?;
 +    credentials.upsert(&state.pool).await?;
++
++    if let Err(error) =
++        crate::onboarding_checklist::mark_logged_into_minecraft().await
++    {
++        tracing::warn!(
++            "Failed to mark Minecraft login in onboarding checklist: {error}"
++        );
++    }
 +
 +    Ok(credentials)
 +}
