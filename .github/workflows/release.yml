@@ -129,6 +129,14 @@ jobs:
       NO_STRIP: true
       TAURI_BUNDLER_DMG_IGNORE_CI: true
     steps:
+      # Windows runners check files out with CRLF by default, which breaks the
+      # patch (it was made against LF files). Must run before any checkout.
+      - name: Keep LF line endings
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - name: Checkout fork (patches)
         uses: actions/checkout@v4
         with:
