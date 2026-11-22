@@ -1,0 +1,457 @@
+From e3e7af597509ff14d6a9d0df9ac89899d73b99d5 Mon Sep 17 00:00:00 2001
+From: Pavle012 <pavle@example.invalid>
+Date: Sun, 22 Nov 2026 14:26:00 +0000
+Subject: [PATCH 2/2] Allow Fabric mods on (Neo)Forge instances with Sinytra
+ Connector
+
+When Sinytra Connector is installed on a Forge or NeoForge instance, Fabric
+mods count as compatible when browsing and installing, as a fallback after
+the instance's own loader. The resolver now treats the loader list as an
+order of preference, and Fabric API is not added as a dependency (Forgified
+Fabric API provides it).
+---
+ apps/app-frontend/src/helpers/sinytra.ts      |  49 +++++++++
+ apps/app-frontend/src/pages/project/Index.vue |   3 +
+ .../platform/adapters/browse/browse-page.vue  |   5 +
+ .../src/providers/content-install.ts          |  22 +++-
+ .../commands/apply_content_install.rs         |  46 +++++++-
+ .../src/install/mod.rs                        |  39 +++++--
+ .../tests/install.rs                          | 104 ++++++++++++++++++
+ 7 files changed, 250 insertions(+), 18 deletions(-)
+ create mode 100644 apps/app-frontend/src/helpers/sinytra.ts
+
+diff --git a/apps/app-frontend/src/helpers/sinytra.ts b/apps/app-frontend/src/helpers/sinytra.ts
+new file mode 100644
+index 0000000..629dcf5
+--- /dev/null
++++ b/apps/app-frontend/src/helpers/sinytra.ts
+@@ -0,0 +1,49 @@
++/**
++ * Sinytra Connector support.
++ *
++ * Connector lets Fabric mods run on (Neo)Forge. On an instance that has it
++ * installed, Fabric mods count as compatible alongside the instance's own
++ * loader, but always as a fallback: a version for the instance's own loader is
++ * preferred over a Fabric one.
++ */
++import { get_installed_project_ids } from '@/helpers/instance'
++
++/** Modrinth project ID of Sinytra Connector. */
++export const SINYTRA_CONNECTOR_PROJECT_ID = 'u58R1TMW'
++
++const CONNECTOR_LOADERS = new Set(['neoforge', 'forge'])
++
++/** Loaders to allow besides the instance's own, given the project IDs installed in it. */
++export function connectorExtraLoaders(
++	loader: string,
++	installedProjectIds: readonly string[] | null | undefined,
++): string[] {
++	return CONNECTOR_LOADERS.has(loader) && installedProjectIds?.includes(SINYTRA_CONNECTOR_PROJECT_ID)
++		? ['fabric']
++		: []
++}
++
++/** Same, given an instance's content files as returned by `get_projects`. */
++export function connectorExtraLoadersFromFiles(
++	loader: string,
++	files: Record<string, { metadata?: { project_id?: string } | null }> | null | undefined,
++): string[] {
++	if (!files) return []
++	return connectorExtraLoaders(
++		loader,
++		Object.values(files).map((file) => file.metadata?.project_id ?? ''),
++	)
++}
++
++/** Same, looking the installed project IDs up for an instance. */
++export async function getConnectorExtraLoaders(
++	instanceId: string,
++	loader: string,
++): Promise<string[]> {
++	if (!CONNECTOR_LOADERS.has(loader)) return []
++	try {
++		return connectorExtraLoaders(loader, await get_installed_project_ids(instanceId))
++	} catch {
++		return []
++	}
++}
+diff --git a/apps/app-frontend/src/pages/project/Index.vue b/apps/app-frontend/src/pages/project/Index.vue
+index 53adf30..7de5c47 100644
+--- a/apps/app-frontend/src/pages/project/Index.vue
++++ b/apps/app-frontend/src/pages/project/Index.vue
+@@ -319,6 +319,7 @@ import {
+ } from '@/helpers/instance'
+ import { get_loader_versions as getLoaderManifest } from '@/helpers/metadata'
+ import { get_by_instance_id } from '@/helpers/process'
++import { connectorExtraLoadersFromFiles } from '@/helpers/sinytra'
+ import { get_categories, get_game_versions, get_loaders } from '@/helpers/tags'
+ import { getServerAddress } from '@/helpers/worlds'
+ import { useServerInstallContent } from '@/platform/adapters/browse/server-install-content'
+@@ -474,6 +475,8 @@ const instanceFilters = computed(() => {
+ 	if (data.value.project_type === 'mod') {
+ 		if (instance.value.loader !== 'vanilla') {
+ 			loaders.push(instance.value.loader)
++			// Sinytra Connector lets Fabric mods run on (Neo)Forge
++			loaders.push(...connectorExtraLoadersFromFiles(instance.value.loader, instanceProjects.value))
+ 		}
+ 		if (instance.value.loader === 'vanilla' || data.value.loaders.includes('datapack')) {
+ 			loaders.push('datapack')
+diff --git a/apps/app-frontend/src/platform/adapters/browse/browse-page.vue b/apps/app-frontend/src/platform/adapters/browse/browse-page.vue
+index c6de02d..39853dc 100644
+--- a/apps/app-frontend/src/platform/adapters/browse/browse-page.vue
++++ b/apps/app-frontend/src/platform/adapters/browse/browse-page.vue
+@@ -57,6 +57,7 @@ import {
+ 	list as listInstances,
+ } from '@/helpers/instance'
+ import { get_loader_versions as getLoaderManifest } from '@/helpers/metadata'
++import { connectorExtraLoaders } from '@/helpers/sinytra'
+ import { get as getSettings, set as setSettings } from '@/helpers/settings.ts'
+ import { get_categories, get_game_versions, get_loaders } from '@/helpers/tags'
+ import { get_instance_worlds } from '@/helpers/worlds'
+@@ -432,6 +433,10 @@ const instanceFilters = computed(() => {
+ 
+ 		if (platform && projectType.value === 'mod' && supportedModLoaders.includes(platform)) {
+ 			filters.push({ type: 'mod_loader', option: platform })
++			// Sinytra Connector lets Fabric mods run on (Neo)Forge
++			for (const extraLoader of connectorExtraLoaders(platform, installedProjectIds.value)) {
++				filters.push({ type: 'mod_loader', option: extraLoader })
++			}
+ 		}
+ 		if (isVanillaShader) {
+ 			filters.push({ type: 'shader_loader', option: 'vanilla' })
+diff --git a/apps/app-frontend/src/providers/content-install.ts b/apps/app-frontend/src/providers/content-install.ts
+index 7978b2d..8c3123c 100644
+--- a/apps/app-frontend/src/providers/content-install.ts
++++ b/apps/app-frontend/src/providers/content-install.ts
+@@ -40,6 +40,7 @@ import {
+ 	remove_project,
+ 	type ResolveContentPlan,
+ } from '@/helpers/instance'
++import { connectorExtraLoadersFromFiles, getConnectorExtraLoaders } from '@/helpers/sinytra'
+ import { get_game_versions } from '@/helpers/tags'
+ import type { GameInstance, InstanceLoader } from '@/helpers/types'
+ import type { AppEvents } from '@/providers/app-events'
+@@ -90,11 +91,14 @@ function isVersionCompatible(
+ 	version: Labrinth.Versions.v2.Version,
+ 	project: Labrinth.Projects.v2.Project,
+ 	instance: Pick<GameInstance, 'game_version' | 'loader'>,
++	extraLoaders: string[] = [],
+ ) {
+ 	return (
+ 		version.game_versions.includes(instance.game_version) &&
+ 		(project.project_type === 'mod'
+-			? version.loaders.includes(instance.loader) || version.loaders.includes('datapack')
++			? version.loaders.includes(instance.loader) ||
++				extraLoaders.some((loader) => version.loaders.includes(loader)) ||
++				version.loaders.includes('datapack')
+ 			: true)
+ 	)
+ }
+@@ -103,6 +107,7 @@ function findPreferredVersion(
+ 	versions: Labrinth.Versions.v2.Version[],
+ 	project: Labrinth.Projects.v2.Project,
+ 	instance: Pick<GameInstance, 'game_version' | 'loader' | 'update_channel'>,
++	extraLoaders: string[] = [],
+ ) {
+ 	const projectType = project.project_type ?? 'mod'
+ 
+@@ -116,7 +121,7 @@ function findPreferredVersion(
+ 			instance.update_channel,
+ 		) ??
+ 		newestVersionForChannel(
+-			versions.filter((v) => isVersionCompatible(v, project, instance)),
++			versions.filter((v) => isVersionCompatible(v, project, instance, extraLoaders)),
+ 			instance.update_channel,
+ 		)
+ 	)
+@@ -663,7 +668,13 @@ export function createContentInstall(opts: {
+ 			return
+ 		}
+ 
+-		const version = findPreferredVersion(currentVersions, currentProject, selectedInstance)
++		const extraLoaders = await getConnectorExtraLoaders(selectedInstance.id, selectedInstance.loader)
++		const version = findPreferredVersion(
++			currentVersions,
++			currentProject,
++			selectedInstance,
++			extraLoaders,
++		)
+ 		if (!version) {
+ 			if (currentVersions.length > 0 && incompatibilityWarningModalRef) {
+ 				const onIncompatibleInstall = (versionId?: string) => {
+@@ -953,12 +964,13 @@ export function createContentInstall(opts: {
+ 				(a, b) => dayjs(b.date_published).valueOf() - dayjs(a.date_published).valueOf(),
+ 			)
+ 
++			const extraLoaders = connectorExtraLoadersFromFiles(instance.loader, instanceProjects)
+ 			let version = versionId
+ 				? projectVersions.find((v) => v.id === versionId)
+-				: findPreferredVersion(projectVersions, project, instance)
++				: findPreferredVersion(projectVersions, project, instance, extraLoaders)
+ 			if (!version) version = projectVersions[0]
+ 
+-			if (isVersionCompatible(version, project, instance)) {
++			if (isVersionCompatible(version, project, instance, extraLoaders)) {
+ 				for (const [path, file] of Object.entries(instanceProjects)) {
+ 					if (file.metadata?.project_id === project.id) {
+ 						await remove_project(instance.id, path)
+diff --git a/packages/app-lib/src/state/instances/commands/apply_content_install.rs b/packages/app-lib/src/state/instances/commands/apply_content_install.rs
+index 63070c1..14b37bd 100644
+--- a/packages/app-lib/src/state/instances/commands/apply_content_install.rs
++++ b/packages/app-lib/src/state/instances/commands/apply_content_install.rs
+@@ -161,21 +161,47 @@ fn dependency_to_resolver(
+     }
+ }
+ 
++/// Sinytra Connector, which lets Fabric mods run on (Neo)Forge.
++const SINYTRA_CONNECTOR_PROJECT_ID: &str = "u58R1TMW";
++/// Fabric API. With Connector it is provided by Forgified Fabric API, and the
++/// real one would clash with it.
++const FABRIC_API_PROJECT_ID: &str = "P7dR8mSH";
++
++/// Whether the instance can run Fabric mods: a (Neo)Forge instance with
++/// Sinytra Connector installed.
++fn fabric_mods_allowed(
++    loader: ModLoader,
++    content_type: ContentType,
++    existing_project_ids: &[String],
++) -> bool {
++    content_type == ContentType::Mod
++        && matches!(loader, ModLoader::NeoForge | ModLoader::Forge)
++        && existing_project_ids
++            .iter()
++            .any(|id| id == SINYTRA_CONNECTOR_PROJECT_ID)
++}
++
+ fn target_preferences(
+     game_version: String,
+     loader: ModLoader,
+     content_type: ContentType,
++    allow_fabric: bool,
+ ) -> ResolutionPreferences {
+-    let loader = match content_type {
++    let mut loaders = vec![match content_type {
+         ContentType::DataPack => "datapack".to_string(),
+         ContentType::ResourcePack => "minecraft".to_string(),
+         ContentType::Shader => "iris".to_string(),
+         _ => loader.as_str().to_string(),
+-    };
++    }];
++    // Listed second, so Fabric versions are only used when there is no
++    // version for the instance's own loader.
++    if allow_fabric {
++        loaders.push("fabric".to_string());
++    }
+ 
+     ResolutionPreferences {
+         game_versions: vec![game_version],
+-        loaders: vec![loader],
++        loaders,
+     }
+ }
+ 
+@@ -193,18 +219,27 @@ pub(crate) async fn resolve_install_plan(
+             .ok_or(ErrorKind::InputError(format!(
+                 "instance {instance_id} has no applied content set"
+             )))?;
+-    let existing_project_ids =
++    let mut existing_project_ids =
+         crate::state::get_installed_project_ids_for_instance(
+             instance_id,
+             None,
+             state,
+         )
+         .await?;
++    let content_type = request.content_type;
++    let allow_fabric = fabric_mods_allowed(
++        content_set.loader,
++        content_type,
++        &existing_project_ids,
++    );
++    if allow_fabric {
++        // Treat Fabric API as installed so it is not added as a dependency.
++        existing_project_ids.push(FABRIC_API_PROJECT_ID.to_string());
++    }
+     let provider = CachedEntryContentProvider {
+         state,
+         cache_behaviour: Some(CacheBehaviour::MustRevalidate),
+     };
+-    let content_type = request.content_type;
+     let request = ResolveContentRequest {
+         project_id: request.project_id,
+         version_id: request.version_id,
+@@ -214,6 +249,7 @@ pub(crate) async fn resolve_install_plan(
+             content_set.game_version,
+             content_set.loader,
+             content_type,
++            allow_fabric,
+         ),
+         existing_project_ids,
+         update_channel: Some(release_channel_to_resolver(
+diff --git a/packages/modrinth-content-management/src/install/mod.rs b/packages/modrinth-content-management/src/install/mod.rs
+index a70a88c..2d4e05b 100644
+--- a/packages/modrinth-content-management/src/install/mod.rs
++++ b/packages/modrinth-content-management/src/install/mod.rs
+@@ -305,15 +305,38 @@ fn select_newest_version(
+     versions.sort_by_key(|version| Reverse(version.date_published));
+     let merged = selected.merge(target);
+ 
+-    newest_in_channel(&versions, update_channel, |version| {
+-        matches(version, &merged)
+-    })
+-    .or_else(|| {
+-        newest_in_channel(&versions, update_channel, |version| {
+-            matches(version, target)
++    // Loaders are listed in order of preference, so a version for an earlier
++    // loader wins over a newer version for a later one.
++    let newest_by_loader_preference = |preferences: &ResolutionPreferences| {
++        loader_tiers(preferences).iter().find_map(|tier| {
++            newest_in_channel(&versions, update_channel, |version| {
++                matches(version, tier)
++            })
+         })
+-    })
+-    .cloned()
++    };
++
++    newest_by_loader_preference(&merged)
++        .or_else(|| newest_by_loader_preference(target))
++        .cloned()
++}
++
++/// Splits preferences listing several loaders into one set of preferences per
++/// loader, in order. Preferences with fewer than two loaders stay as they are.
++fn loader_tiers(
++    preferences: &ResolutionPreferences,
++) -> Vec<ResolutionPreferences> {
++    if preferences.loaders.len() < 2 {
++        return vec![preferences.clone()];
++    }
++
++    preferences
++        .loaders
++        .iter()
++        .map(|loader| ResolutionPreferences {
++            game_versions: preferences.game_versions.clone(),
++            loaders: vec![loader.clone()],
++        })
++        .collect()
+ }
+ 
+ /// Finds the newest matching version within the update channel, widening the channel one step at
+diff --git a/packages/modrinth-content-management/tests/install.rs b/packages/modrinth-content-management/tests/install.rs
+index cd2e803..6b6960a 100644
+--- a/packages/modrinth-content-management/tests/install.rs
++++ b/packages/modrinth-content-management/tests/install.rs
+@@ -772,4 +772,108 @@ mod tests {
+         );
+         assert_eq!(plan.skipped[0].project_id, "LNytGWDc");
+     }
++    fn multi_loader_request(
++        project_id: &str,
++        loaders: &[&str],
++    ) -> ResolveContentRequest {
++        let mut request = request(project_id);
++        request.target = ResolutionPreferences {
++            game_versions: vec!["1.20.1".to_string()],
++            loaders: loaders.iter().map(|loader| loader.to_string()).collect(),
++        };
++        request
++    }
++
++    #[tokio::test]
++    async fn earlier_loader_wins_over_newer_version_of_later_loader() {
++        let provider = MemoryProvider::default().with_versions(vec![
++            version(
++                "neoforge-old",
++                "p1",
++                "2024-01-01T00:00:00Z",
++                &["1.20.1"],
++                &["neoforge"],
++                vec![],
++            ),
++            version(
++                "fabric-new",
++                "p1",
++                "2024-06-01T00:00:00Z",
++                &["1.20.1"],
++                &["fabric"],
++                vec![],
++            ),
++        ]);
++
++        let plan = resolve_content(
++            provider,
++            multi_loader_request("p1", &["neoforge", "fabric"]),
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(plan.primary.version_id, "neoforge-old");
++    }
++
++    #[tokio::test]
++    async fn later_loader_is_used_when_the_earlier_one_has_no_version() {
++        let provider = MemoryProvider::default().with_versions(vec![version(
++            "fabric-only",
++            "p1",
++            "2024-06-01T00:00:00Z",
++            &["1.20.1"],
++            &["fabric"],
++            vec![],
++        )]);
++
++        let plan = resolve_content(
++            provider,
++            multi_loader_request("p1", &["neoforge", "fabric"]),
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(plan.primary.version_id, "fabric-only");
++    }
++
++    #[tokio::test]
++    async fn dependencies_prefer_the_earlier_loader_too() {
++        let provider = MemoryProvider::default().with_versions(vec![
++            version(
++                "mod-fabric",
++                "p1",
++                "2024-06-01T00:00:00Z",
++                &["1.20.1"],
++                &["fabric"],
++                vec![required_project_dependency("lib")],
++            ),
++            version(
++                "lib-neoforge",
++                "lib",
++                "2024-01-01T00:00:00Z",
++                &["1.20.1"],
++                &["neoforge"],
++                vec![],
++            ),
++            version(
++                "lib-fabric",
++                "lib",
++                "2024-06-01T00:00:00Z",
++                &["1.20.1"],
++                &["fabric"],
++                vec![],
++            ),
++        ]);
++
++        let plan = resolve_content(
++            provider,
++            multi_loader_request("p1", &["neoforge", "fabric"]),
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(plan.primary.version_id, "mod-fabric");
++        assert_eq!(plan.dependencies.len(), 1);
++        assert_eq!(plan.dependencies[0].version_id, "lib-neoforge");
++    }
+ }
+-- 
+2.43.0
+
