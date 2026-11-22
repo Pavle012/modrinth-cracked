@@ -33,7 +33,7 @@ index d3dc0af..b1e386e 100644
  
 -    sqlx::migrate!().run(&pool).await?;
 +    let migrator = sqlx::migrate!();
-+    repair_line_ending_migration_checksums(&pool, migrator).await?;
++    repair_line_ending_migration_checksums(&pool, &migrator).await?;
 +    migrator.run(&pool).await?;
      record_current_app_version(&pool).await?;
  
