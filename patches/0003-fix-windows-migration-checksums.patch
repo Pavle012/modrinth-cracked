@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavle012 <pavle@example.invalid>
+Date: Sun, 22 Nov 2026 12:17:00 +0100
+Subject: [PATCH] Repair line-ending-only migration checksum mismatches
+
+SQLx hashes migration files byte-for-byte, so CRLF databases can fail to
+open when a release embeds the same migration with LF line endings. Repair
+only checksums that match an exact LF/CRLF conversion of the current SQL.
+---
+ packages/app-lib/src/state/db.rs | 112 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 110 insertions(+), 2 deletions(-)
+
+diff --git a/packages/app-lib/src/state/db.rs b/packages/app-lib/src/state/db.rs
+index d3dc0af..b1e386e 100644
+--- a/packages/app-lib/src/state/db.rs
++++ b/packages/app-lib/src/state/db.rs
+@@ -1,9 +1,11 @@
+ use crate::ErrorKind;
+ use crate::state::DirectoryInfo;
++use sha2::{Digest, Sha384};
+ use sqlx::sqlite::{
+     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
+ };
+-use sqlx::{Pool, Sqlite};
++use sqlx::migrate::{Migration, Migrator};
++use sqlx::{Pool, Row, Sqlite};
+ use std::path::Path;
+ use std::time::Duration;
+ 
+@@ -42,7 +44,9 @@ async fn open_migrated_app_db(db_path: &Path) -> crate::Result<Pool<Sqlite>> {
+         );
+     }
+ 
+-    sqlx::migrate!().run(&pool).await?;
++    let migrator = sqlx::migrate!();
++    repair_line_ending_migration_checksums(&pool, migrator).await?;
++    migrator.run(&pool).await?;
+     record_current_app_version(&pool).await?;
+ 
+     if let Err(err) = stale_data_cleanup(&pool).await {
+@@ -54,6 +58,77 @@ async fn open_migrated_app_db(db_path: &Path) -> crate::Result<Pool<Sqlite>> {
+     Ok(pool)
+ }
+ 
++async fn repair_line_ending_migration_checksums(
++    pool: &Pool<Sqlite>,
++    migrator: &Migrator,
++) -> crate::Result<()> {
++    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
++    let has_migrations_table = sqlx::query_scalar::<_, i64>(
++        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
++    )
++    .fetch_one(&mut *tx)
++    .await?
++        > 0;
++
++    if !has_migrations_table {
++        tx.commit().await?;
++        return Ok(());
++    }
++
++    let applied_migrations =
++        sqlx::query("SELECT version, checksum FROM _sqlx_migrations")
++            .fetch_all(&mut *tx)
++            .await?;
++
++    for applied in applied_migrations {
++        let version: i64 = applied.try_get("version")?;
++        let checksum: Vec<u8> = applied.try_get("checksum")?;
++        let Some(migration) = migrator.iter().find(|migration| {
++            migration.version == version
++                && migration.migration_type.is_up_migration()
++        }) else {
++            continue;
++        };
++
++        if !is_line_ending_only_checksum(migration, &checksum) {
++            continue;
++        }
++
++        sqlx::query(
++            "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?",
++        )
++        .bind(migration.checksum.as_ref())
++        .bind(version)
++        .execute(&mut *tx)
++        .await?;
++        tracing::info!(
++            "Repaired line-ending-only checksum mismatch for database migration {version}"
++        );
++    }
++
++    tx.commit().await?;
++    Ok(())
++}
++
++fn is_line_ending_only_checksum(
++    migration: &Migration,
++    applied_checksum: &[u8],
++) -> bool {
++    if applied_checksum == migration.checksum.as_ref() {
++        return false;
++    }
++
++    let lf_sql = migration.sql.as_str().replace("\r\n", "\n");
++    let lf_checksum = Sha384::digest(lf_sql.as_bytes());
++    if applied_checksum == lf_checksum.as_slice() {
++        return true;
++    }
++
++    let crlf_sql = lf_sql.replace('\n', "\r\n");
++    let crlf_checksum = Sha384::digest(crlf_sql.as_bytes());
++    applied_checksum == crlf_checksum.as_slice()
++}
++
+ async fn open_app_db_pool(db_path: &Path) -> crate::Result<Pool<Sqlite>> {
+     let conn_options = SqliteConnectOptions::new()
+         .filename(db_path)
+@@ -70,6 +145,39 @@ async fn open_app_db_pool(db_path: &Path) -> crate::Result<Pool<Sqlite>> {
+         .await?)
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::is_line_ending_only_checksum;
++    use sha2::{Digest, Sha384};
++    use sqlx::migrate::{Migration, MigrationType};
++    use sqlx::SqlSafeStr;
++
++    #[test]
++    fn accepts_only_line_ending_checksum_changes() {
++        let migration = Migration::new(
++            1,
++            "test".into(),
++            MigrationType::Simple,
++            "CREATE TABLE test (\n    id INTEGER\n);\n".into_sql_str(),
++            false,
++        );
++        let crlf_checksum = Sha384::digest(
++            "CREATE TABLE test (\r\n    id INTEGER\r\n);\r\n".as_bytes(),
++        );
++        let edited_checksum =
++            Sha384::digest("CREATE TABLE changed (id INTEGER);\n".as_bytes());
++
++        assert!(is_line_ending_only_checksum(
++            &migration,
++            crlf_checksum.as_slice()
++        ));
++        assert!(!is_line_ending_only_checksum(
++            &migration,
++            edited_checksum.as_slice()
++        ));
++    }
++}
++
+ async fn record_current_app_version(pool: &Pool<Sqlite>) -> crate::Result<()> {
+     let previous_version = sqlx::query_scalar!(
+         "SELECT value FROM app_metadata WHERE key = 'app_version'"
