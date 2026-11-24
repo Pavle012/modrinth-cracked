@@ -1,0 +1,407 @@
+From: Pavle012 <pavle@example.invalid>
+Subject: [PATCH] Add AstralRinth instance migration
+
+diff --git a/apps/app-frontend/src/App.vue b/apps/app-frontend/src/App.vue
+index 0844b05..e3b1b70 100644
+--- a/apps/app-frontend/src/App.vue
++++ b/apps/app-frontend/src/App.vue
+@@ -111,6 +111,7 @@ import SharedInstanceModals from '@/features/library/shared-instances/shared-ins
+ import { provideMinecraftAccounts } from '@/features/minecraft-accounts/context'
+ import AppSettingsModal from '@/features/settings/app-settings-modal/index.vue'
+ import { provideSettingsActions } from '@/features/settings/settings-actions'
++import AstralRinthMigrationModal from '@/components/ui/astralrinth/AstralRinthMigrationModal.vue'
+ import NewUpdateModal from '@/features/updates/new-update-modal/index.vue'
+ import { getAccountAppearance, rememberAccountAppearance } from '@/helpers/account-appearance.ts'
+ import {
+@@ -790,6 +791,9 @@ async function setupApp() {
+ 	stateInitialized.value = true
+ 	debugStartup('App state initialized')
+ 	await traceStartupStep('Render initialized app', nextTick)
++	await traceStartupStep('Detect AstralRinth migration', () =>
++		astralRinthMigrationModal.value?.run(),
++	)
+ 	await newUpdateModal.value?.notifyForVersion(version, pending_update_toast_for_version)
+ 
+ 	await traceStartupStep('Register window resize listener', () =>
+@@ -980,6 +984,7 @@ const updateToPlayModal = ref()
+ const modrinthLoginModal = ref()
+ const appSettingsModal = ref()
+ const newUpdateModal = ref()
++const astralRinthMigrationModal = ref()
+ 
+ const settingsActions = provideSettingsActions({
+ 	openSettings: () => appSettingsModal.value?.show(),
+@@ -2007,6 +2012,7 @@ provideAppUpdateDownloadProgress(appUpdateDownload)
+ 			</div>
+ 		</Transition>
+ 		<AppSettingsModal ref="appSettingsModal" />
++		<AstralRinthMigrationModal ref="astralRinthMigrationModal" />
+ 		<NewUpdateModal ref="newUpdateModal" />
+ 		<Suspense>
+ 			<ModrinthAccountRequiredModal ref="modrinthLoginModal" :request-auth="requestModrinthAuth" />
+diff --git a/apps/app-frontend/src/components/ui/astralrinth/AstralRinthMigrationModal.vue b/apps/app-frontend/src/components/ui/astralrinth/AstralRinthMigrationModal.vue
+new file mode 100644
+index 0000000..7af1f1d
+--- /dev/null
++++ b/apps/app-frontend/src/components/ui/astralrinth/AstralRinthMigrationModal.vue
+@@ -0,0 +1,65 @@
++<script setup lang="ts">
++import { ConfirmModal } from '@modrinth/ui'
++import { ref } from 'vue'
++import type { InstanceType } from 'vue'
++
++import {
++	astralrinthStatus,
++	portAstralRinthInstances,
++	removeAstralRinth,
++} from '@/helpers/settings.ts'
++
++const modal = ref<InstanceType<typeof ConfirmModal> | null>(null)
++const removeModal = ref<InstanceType<typeof ConfirmModal> | null>(null)
++const porting = ref(false)
++const removing = ref(false)
++const portedCount = ref(0)
++
++async function run() {
++	if (!(await astralrinthStatus())) return false
++	modal.value?.show()
++	return true
++}
++
++async function port() {
++	porting.value = true
++	try {
++		portedCount.value = await portAstralRinthInstances()
++		removeModal.value?.show()
++	} finally {
++		porting.value = false
++	}
++}
++
++async function remove() {
++	removing.value = true
++	try {
++		await removeAstralRinth()
++		removeModal.value?.hide()
++	} finally {
++		removing.value = false
++	}
++}
++
++defineExpose({ run })
++</script>
++
++<template>
++	<ConfirmModal
++		ref="modal"
++		title="Import instances from AstralRinth?"
++		description="AstralRinth was detected on this device. Import all of its instances, settings, accounts, and world data into this launcher?"
++		proceed-label="Import"
++		:show-ad-on-close="false"
++		@proceed="port"
++	/>
++	<ConfirmModal
++		ref="removeModal"
++		title="Remove AstralRinth?"
++		:description="`AstralRinth import is finished (${portedCount} instances ported). Remove AstralRinth and all of its local app data?`"
++		proceed-label="Remove AstralRinth"
++		danger
++		:show-ad-on-close="false"
++		@proceed="remove"
++	/>
++</template>
+diff --git a/apps/app-frontend/src/features/settings/system/resource-management-settings/index.vue b/apps/app-frontend/src/features/settings/system/resource-management-settings/index.vue
+index ae1fefe..8bf01e5 100644
+--- a/apps/app-frontend/src/features/settings/system/resource-management-settings/index.vue
++++ b/apps/app-frontend/src/features/settings/system/resource-management-settings/index.vue
+@@ -1,9 +1,15 @@
+ <script setup>
+-import { defineMessages, injectNotificationManager, Slider, useVIntl } from '@modrinth/ui'
++import { Button, defineMessages, injectNotificationManager, Slider, useVIntl } from '@modrinth/ui'
+ import { useMutation, useQueryClient } from '@tanstack/vue-query'
+ import { ref, watch } from 'vue'
+ 
+-import { appSettingsKeys, get, set } from '@/helpers/settings.ts'
++import {
++	appSettingsKeys,
++	get,
++	set,
++} from '@/helpers/settings.ts'
++import { ImportIcon } from '@modrinth/assets'
++import AstralRinthMigrationModal from '@/components/ui/astralrinth/AstralRinthMigrationModal.vue'
+ 
+ import AppDirectorySettings from './app-directory/index.vue'
+ import ContentStorageSettings from './content-storage.vue'
+@@ -12,6 +18,7 @@ const { formatMessage } = useVIntl()
+ const { handleError } = injectNotificationManager()
+ const queryClient = useQueryClient()
+ const settings = ref(await get())
++const migrationModal = ref(null)
+ 
+ const messages = defineMessages({
+ 	maximumConcurrentDownloadsTitle: {
+@@ -54,9 +61,21 @@ watch(
+ 
+ <template>
+ 	<div class="flex flex-col gap-6">
++		<AstralRinthMigrationModal ref="migrationModal" />
+ 		<ContentStorageSettings />
+ 		<AppDirectorySettings />
+ 
++		<div class="flex flex-col gap-2.5">
++			<h2 class="m-0 text-lg font-semibold text-contrast">AstralRinth migration</h2>
++			<Button class="w-fit" @click="migrationModal?.run()">
++				<ImportIcon aria-hidden="true" />
++				Port instances from AstralRinth
++			</Button>
++			<p class="m-0 leading-tight text-secondary">
++				Import AstralRinth instances and local launcher data into this installation.
++			</p>
++		</div>
++
+ 		<div class="flex flex-col gap-2.5">
+ 			<h2 class="m-0 text-lg font-semibold text-contrast mt-4">
+ 				{{ formatMessage(messages.maximumConcurrentDownloadsTitle) }}
+diff --git a/apps/app-frontend/src/helpers/settings.ts b/apps/app-frontend/src/helpers/settings.ts
+index 29a9e79..48b842f 100644
+--- a/apps/app-frontend/src/helpers/settings.ts
++++ b/apps/app-frontend/src/helpers/settings.ts
+@@ -137,6 +137,18 @@ export async function set(settings: AppSettings) {
+ 	return await invoke('plugin:settings|settings_set', { settings })
+ }
+ 
++export async function astralrinthStatus(): Promise<boolean> {
++	return await invoke('plugin:settings|astralrinth_status')
++}
++
++export async function portAstralRinthInstances(): Promise<number> {
++	return await invoke('plugin:settings|port_astralrinth_instances')
++}
++
++export async function removeAstralRinth(): Promise<void> {
++	await invoke('plugin:settings|remove_astralrinth')
++}
++
+ export async function cancel_directory_change(): Promise<void> {
+ 	return await invoke('plugin:settings|cancel_directory_change')
+ }
+diff --git a/apps/app/build.rs b/apps/app/build.rs
+index f53ffdf..07a1bef 100644
+--- a/apps/app/build.rs
++++ b/apps/app/build.rs
+@@ -344,6 +344,9 @@ fn main() {
+                         "store_set_cache_limit",
+                         "cancel_directory_change",
+                         "default_app_directory",
++                        "astralrinth_status",
++                        "port_astralrinth_instances",
++                        "remove_astralrinth",
+                     ])
+                     .default_permission(
+                         DefaultPermissionRule::AllowAllCommands,
+diff --git a/apps/app/src/api/settings.rs b/apps/app/src/api/settings.rs
+index 8068f68..f83714f 100644
+--- a/apps/app/src/api/settings.rs
++++ b/apps/app/src/api/settings.rs
+@@ -11,11 +11,29 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+             store_cleanup,
+             store_set_cache_limit,
+             cancel_directory_change,
+-            default_app_directory
++            default_app_directory,
++            astralrinth_status,
++            port_astralrinth_instances,
++            remove_astralrinth
+         ])
+         .build()
+ }
+ 
++#[tauri::command]
++pub async fn astralrinth_status() -> Result<bool> {
++    Ok(settings::astralrinth_status().await?)
++}
++
++#[tauri::command]
++pub async fn port_astralrinth_instances() -> Result<usize> {
++    Ok(settings::port_astralrinth_instances().await?)
++}
++
++#[tauri::command]
++pub async fn remove_astralrinth() -> Result<()> {
++    Ok(settings::remove_astralrinth().await?)
++}
++
+ #[tauri::command]
+ pub async fn default_app_directory() -> Result<std::path::PathBuf> {
+     Ok(settings::default_app_directory().await?)
+diff --git a/packages/app-lib/src/api/settings.rs b/packages/app-lib/src/api/settings.rs
+index 08d2321..7bacce6 100644
+--- a/packages/app-lib/src/api/settings.rs
++++ b/packages/app-lib/src/api/settings.rs
+@@ -5,6 +5,98 @@ pub use crate::{
+     State,
+     state::{Hooks, MemorySettings, Settings, WindowSize},
+ };
++use std::path::{Path, PathBuf};
++
++fn astralrinth_settings_dir() -> Option<PathBuf> {
++    Some(dirs::data_dir()?.join("AstralRinthApp"))
++}
++
++fn astralrinth_is_present() -> bool {
++    let Some(root) = astralrinth_settings_dir() else {
++        return false;
++    };
++    root.join("settings.json").is_file()
++        || root.join("profiles").is_dir()
++        || root.join("app.db").is_file()
++}
++
++pub async fn astralrinth_status() -> crate::Result<bool> {
++    Ok(astralrinth_is_present())
++}
++
++pub async fn port_astralrinth_instances() -> crate::Result<usize> {
++    let state = State::get().await?;
++    let Some(root) = astralrinth_settings_dir() else {
++        return Ok(0);
++    };
++    if !astralrinth_is_present() {
++        return Ok(0);
++    }
++
++    let source_profiles = astralrinth_custom_dir(&root)
++        .unwrap_or_else(|| root.clone())
++        .join("profiles");
++    if source_profiles.is_dir() {
++        let destination_profiles = state.directories.config_dir.join("profiles");
++        tokio::fs::create_dir_all(&destination_profiles).await?;
++        copy_directory_contents(&source_profiles, &destination_profiles).await?;
++    }
++
++    let count = crate::state::legacy_converter::migrate_legacy_data_from(
++        &root,
++        &state.pool,
++        false,
++    )
++    .await?;
++    Ok(count)
++}
++
++async fn copy_directory_contents(source: &Path, destination: &Path) -> crate::Result<()> {
++    let mut entries = tokio::fs::read_dir(source).await?;
++    while let Some(entry) = entries.next_entry().await? {
++        let source_path = entry.path();
++        let destination_path = destination.join(entry.file_name());
++        if source_path.is_dir() {
++            tokio::fs::create_dir_all(&destination_path).await?;
++            copy_directory_contents(&source_path, &destination_path).await?;
++        } else if source_path.is_file()
++            && !destination_path.exists()
++        {
++            tokio::fs::copy(&source_path, &destination_path).await?;
++        }
++    }
++    Ok(())
++}
++
++fn astralrinth_custom_dir(root: &Path) -> Option<PathBuf> {
++    let settings: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(root.join("settings.json")).ok()?)
++            .ok()?;
++    let path = settings.get("loaded_config_dir")?.as_str()?;
++    let path = PathBuf::from(path);
++    if path == root {
++        return None;
++    }
++    path.join("profiles").is_dir().then_some(path)
++}
++
++pub async fn remove_astralrinth() -> crate::Result<()> {
++    let Some(root) = astralrinth_settings_dir() else {
++        return Ok(());
++    };
++    let custom_dir = astralrinth_custom_dir(&root);
++
++    if root.is_dir() {
++        tokio::fs::remove_dir_all(&root).await?;
++    }
++    if let Some(custom_dir) = custom_dir {
++        let profiles_dir = custom_dir.join("profiles");
++        if profiles_dir.is_dir() {
++            tokio::fs::remove_dir_all(profiles_dir).await?;
++        }
++    }
++    Ok(())
++}
+ 
+ pub async fn store_usage() -> crate::Result<StoreUsage> {
+     let state = State::get().await?;
+diff --git a/packages/app-lib/src/state/legacy_converter.rs b/packages/app-lib/src/state/legacy_converter.rs
+index 13901e4..efefa8f 100644
+--- a/packages/app-lib/src/state/legacy_converter.rs
++++ b/packages/app-lib/src/state/legacy_converter.rs
+@@ -38,10 +38,25 @@ where
+     let Some(old_launcher_root) = default_settings_dir() else {
+         return Ok(());
+     };
++
++    migrate_legacy_data_from(&old_launcher_root, exec, true).await?;
++    Ok(())
++}
++
++pub async fn migrate_legacy_data_from<'a, E>(
++    old_launcher_root: &PathBuf,
++    exec: E,
++    mark_migrated: bool,
++) -> crate::Result<usize>
++where
++    E: sqlx::Executor<'a, Database = sqlx::Sqlite> + Copy,
++{
++    let mut settings = state::Settings::get(exec).await?;
+     let old_launcher_root_str = old_launcher_root.to_string_lossy().to_string();
+ 
+     let io_semaphore = IoSemaphore(Semaphore::new(10));
+     let settings_path = old_launcher_root.join("settings.json");
++    let mut migrated_instances = 0;
+ 
+     if let Ok(legacy_settings) =
+         read_json::<LegacySettings>(&settings_path, &io_semaphore).await
+@@ -375,6 +390,7 @@ where
+                     },
+                 )
+                 .await?;
++                migrated_instances += 1;
+             }
+         }
+ 
+@@ -392,11 +408,13 @@ where
+         )
+         .await?;
+ 
+-        settings.migrated = true;
+-        settings.update(exec).await?;
++        if mark_migrated {
++            settings.migrated = true;
++            settings.update(exec).await?;
++        }
+     }
+ 
+-    Ok(())
++    Ok(migrated_instances)
+ }
+ 
+ struct LegacyInstanceUpsert {
+diff --git a/packages/app-lib/src/state/mod.rs b/packages/app-lib/src/state/mod.rs
+index 6f3330e..5267d83 100644
+--- a/packages/app-lib/src/state/mod.rs
++++ b/packages/app-lib/src/state/mod.rs
+@@ -76,7 +76,7 @@ mod mr_auth;
+ 
+ pub use self::mr_auth::*;
+ 
+-mod legacy_converter;
++pub(crate) mod legacy_converter;
+ 
+ pub mod attached_world_data;
+ pub mod hidden_instances;
