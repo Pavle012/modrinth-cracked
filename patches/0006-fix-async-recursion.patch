@@ -1,0 +1,15 @@
+From: Pavle012 <pavle@example.invalid>
+Subject: [PATCH] Fix recursive async migration helper
+
+---
+diff --git a/packages/app-lib/src/api/settings.rs b/packages/app-lib/src/api/settings.rs
+index 7bacce6..7bacce6 100644
+--- a/packages/app-lib/src/api/settings.rs
++++ b/packages/app-lib/src/api/settings.rs
+@@ -291,6 +291,7 @@ pub async fn port_astralrinth_instances() -> crate::Result<usize> {
+     Ok(count)
+ }
+ 
++#[async_recursion::async_recursion]
+ async fn copy_directory_contents(source: &Path, destination: &Path) -> crate::Result<()> {
+     let mut entries = tokio::fs::read_dir(source).await?;
