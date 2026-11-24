@@ -1,4 +1,6 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavle012 <pavle@example.invalid>
+Date: Tue, 24 Nov 2026 14:53:00 +0100
 Subject: [PATCH] Add AstralRinth instance migration
 
 diff --git a/apps/app-frontend/src/App.vue b/apps/app-frontend/src/App.vue
@@ -235,10 +237,10 @@ index 8068f68..f83714f 100644
  pub async fn default_app_directory() -> Result<std::path::PathBuf> {
      Ok(settings::default_app_directory().await?)
 diff --git a/packages/app-lib/src/api/settings.rs b/packages/app-lib/src/api/settings.rs
-index 08d2321..7bacce6 100644
+index 08d2321..211a2b4 100644
 --- a/packages/app-lib/src/api/settings.rs
 +++ b/packages/app-lib/src/api/settings.rs
-@@ -5,6 +5,98 @@ pub use crate::{
+@@ -5,6 +5,102 @@ pub use crate::{
      State,
      state::{Hooks, MemorySettings, Settings, WindowSize},
  };
@@ -289,17 +291,21 @@ index 08d2321..7bacce6 100644
 +}
 +
 +async fn copy_directory_contents(source: &Path, destination: &Path) -> crate::Result<()> {
-+    let mut entries = tokio::fs::read_dir(source).await?;
-+    while let Some(entry) = entries.next_entry().await? {
-+        let source_path = entry.path();
-+        let destination_path = destination.join(entry.file_name());
-+        if source_path.is_dir() {
-+            tokio::fs::create_dir_all(&destination_path).await?;
-+            copy_directory_contents(&source_path, &destination_path).await?;
-+        } else if source_path.is_file()
-+            && !destination_path.exists()
-+        {
-+            tokio::fs::copy(&source_path, &destination_path).await?;
++    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
++
++    while let Some((source_dir, destination_dir)) = pending.pop() {
++        let mut entries = tokio::fs::read_dir(source_dir).await?;
++        while let Some(entry) = entries.next_entry().await? {
++            let source_path = entry.path();
++            let destination_path = destination_dir.join(entry.file_name());
++            if source_path.is_dir() {
++                tokio::fs::create_dir_all(&destination_path).await?;
++                pending.push((source_path, destination_path));
++            } else if source_path.is_file()
++                && !destination_path.exists()
++            {
++                tokio::fs::copy(&source_path, &destination_path).await?;
++            }
 +        }
 +    }
 +    Ok(())
@@ -338,9 +344,18 @@ index 08d2321..7bacce6 100644
  pub async fn store_usage() -> crate::Result<StoreUsage> {
      let state = State::get().await?;
 diff --git a/packages/app-lib/src/state/legacy_converter.rs b/packages/app-lib/src/state/legacy_converter.rs
-index 13901e4..efefa8f 100644
+index 13901e4..d3a4cd4 100644
 --- a/packages/app-lib/src/state/legacy_converter.rs
 +++ b/packages/app-lib/src/state/legacy_converter.rs
+@@ -29,7 +29,7 @@ pub async fn migrate_legacy_data<'a, E>(exec: E) -> crate::Result<()>
+ where
+     E: sqlx::Executor<'a, Database = sqlx::Sqlite> + Copy,
+ {
+-    let mut settings = state::Settings::get(exec).await?;
++    let settings = state::Settings::get(exec).await?;
+ 
+     if settings.migrated {
+         return Ok(());
 @@ -38,10 +38,25 @@ where
      let Some(old_launcher_root) = default_settings_dir() else {
          return Ok(());

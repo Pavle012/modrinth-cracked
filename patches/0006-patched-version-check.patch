@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavle012 <pavle@example.invalid>
+Date: Tue, 24 Nov 2026 14:53:00 +0100
+Subject: [PATCH] Check for patched launcher releases
+
+diff --git a/apps/app-frontend/src/App.vue b/apps/app-frontend/src/App.vue
+index 0844b05..f3b21a9 100644
+--- a/apps/app-frontend/src/App.vue
++++ b/apps/app-frontend/src/App.vue
+@@ -1602,6 +1602,19 @@ const updatePopupMessages = defineMessages({
+ 		id: 'app.update-popup.title',
+ 		defaultMessage: 'Update available',
+ 	},
++	patchedUpdateAvailable: {
++		id: 'app.patched-update-popup.title',
++		defaultMessage: 'New launcher version available',
++	},
++	patchedUpdateBody: {
++		id: 'app.patched-update-popup.body',
++		defaultMessage:
++			'Version {version} is available. Download the new version from kubabin.dev/launcher.',
++	},
++	patchedUpdateButton: {
++		id: 'app.patched-update-popup.download',
++		defaultMessage: 'Open download page',
++	},
+ 	downloadComplete: {
+ 		id: 'app.update-popup.download-complete',
+ 		defaultMessage: 'Download complete',
+@@ -1736,14 +1749,13 @@ function showDelayedUpdatePopup() {
+ }
+ 
+ async function checkUpdates() {
++	checkPatchedUpdates()
++	setInterval(checkPatchedUpdates, 5 /* min */ * 60 /* sec */ * 1000)
++
+ 	if (!(await areUpdatesEnabled())) {
+ 		console.log('Skipping update check as updates are disabled in this build or environment')
+ 		updatesEnabled.value = false
+ 
+-		if (os.value === 'Linux' && !isDevEnvironment.value) {
+-			checkLinuxUpdates()
+-			setInterval(checkLinuxUpdates, 5 * 60 * 1000)
+-		}
+ 		return
+ 	}
+ 
+@@ -1792,31 +1804,50 @@ async function checkUpdates() {
+ 	)
+ }
+ 
+-async function checkLinuxUpdates() {
++let notifiedPatchedVersion: string | null = null
++
++async function checkPatchedUpdates() {
+ 	try {
+ 		const [response, currentVersion] = await Promise.all([
+-			fetch('https://launcher-files.modrinth.com/updates.json'),
++			tauriFetch(
++				'https://api.github.com/repos/Pavle012/modrinth-cracked/releases/latest',
++				{ headers: { Accept: 'application/vnd.github+json' } },
++			),
+ 			getVersion(),
+ 		])
+-		const updates = await response.json()
+-		const latestVersion = updates?.version
+-
+-		if (latestVersion && latestVersion !== currentVersion) {
+-			markAppUpdateActionable(latestVersion)
+-			const nextPopupTime = getNextAppUpdatePopupTime(latestVersion)
+-			if (nextPopupTime !== null && Date.now() >= nextPopupTime) {
+-				addPopupNotification({
+-					contentType: 'standard',
+-					title: formatMessage(updatePopupMessages.updateAvailable),
+-					text: formatMessage(updatePopupMessages.linuxBody, { version: latestVersion }),
+-					type: 'info',
+-					autoCloseMs: null,
+-				})
+-				markAppUpdatePopupShown(latestVersion)
+-			}
++		if (!response.ok) {
++			console.error('Failed to check for patched launcher updates:', response.status)
++			return
++		}
++
++		const release = await response.json()
++		const latestVersion = release?.tag_name?.replace(/^v/, '')
++
++		if (
++			latestVersion &&
++			latestVersion !== currentVersion &&
++			latestVersion !== notifiedPatchedVersion
++		) {
++			notifiedPatchedVersion = latestVersion
++			addPopupNotification({
++				contentType: 'standard',
++				title: formatMessage(updatePopupMessages.patchedUpdateAvailable),
++				text: formatMessage(updatePopupMessages.patchedUpdateBody, {
++					version: latestVersion,
++				}),
++				type: 'info',
++				autoCloseMs: null,
++				buttons: [
++					{
++						label: formatMessage(updatePopupMessages.patchedUpdateButton),
++						action: () => openUrl('https://kubabin.dev/launcher'),
++						color: 'brand',
++					},
++				],
++			})
+ 		}
+ 	} catch (e) {
+-		console.error('Failed to check for updates:', e)
++		console.error('Failed to check for patched launcher updates:', e)
+ 	}
+ }
+ 
